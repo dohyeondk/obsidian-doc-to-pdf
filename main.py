@@ -9,16 +9,17 @@ from pypdf import PdfWriter, PdfReader
 SITE_UID = "f786db9fac45774fa4f0d8112e232d67"
 BASE_URL = "https://help.obsidian.md"
 OPTIONS_API = f"https://publish-01.obsidian.md/options/{SITE_UID}"
+CACHE_API = f"https://publish-01.obsidian.md/cache/{SITE_UID}"
 
-# Custom CSS for PDF generation
+# Minimal CSS — only hides non-content chrome; keeps all site fonts/styles intact
 custom_css = """
-/* Hide navigation, sidebars, and non-content elements */
 .site-body-left-column,
 .site-body-right-column,
 .site-header,
 .site-footer,
 .graph-view-container,
 .backlinks,
+.mod-footer,
 .outline-view-container,
 .site-body-left-column-site-name,
 .published-search-container,
@@ -27,56 +28,96 @@ custom_css = """
 .nav-header,
 .nav-folder,
 .nav-file,
-.site-component-navbar {
+.site-component-navbar,
+.extra-title {
     display: none !important;
 }
 
-/* Remove layout constraints so content fills the page */
-body, .published-container {
-    height: inherit;
-    overflow: inherit;
+.callout.is-collapsed {
+    height: auto !important;
+    overflow: visible !important;
 }
-
-.site-body {
+.callout.is-collapsed .callout-content {
     display: block !important;
 }
 
 .site-body-center-column {
-    max-width: 100% !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    width: 100% !important;
-}
-
-/* Typography */
-.markdown-rendered {
-    font-family: "Helvetica Neue", sans-serif;
-    font-weight: 400;
-}
-
-h1, h2, h3, h4, h5, h6 {
-    font-family: "Georgia", serif !important;
-}
-
-code {
-    font-family: "Menlo", monospace !important;
-}
-
-.markdown-rendered, blockquote > p, table {
-    font-size: 0.8em;
+    margin: 0 auto !important;
+    padding: 0 20px !important;
 }
 """
+
+# JS that runs on the live page before PDF export.  Removes non-content
+# DOM nodes and stretches the viewport-locked containers to fit content
+# so Chromium's PDF renderer doesn't create trailing blank pages.
+PREPARE_FOR_PRINT_JS = """() => {
+    // Remove non-content elements
+    const removeSelectors = [
+        '.site-body-left-column', '.site-body-right-column',
+        '.site-header', '.site-footer', '.graph-view-container',
+        '.backlinks', '.mod-footer', '.outline-view-container',
+        '.extra-title', '.site-component-navbar',
+        '.published-search-container', '.nav-header',
+    ];
+    for (const sel of removeSelectors) {
+        document.querySelectorAll(sel).forEach(el => el.remove());
+    }
+
+    // Unlock overflow on every wrapper so nothing is clipped.
+    const containers = document.querySelectorAll(
+        '.published-container, .site-body, ' +
+        '.site-body-center-column, .render-container, ' +
+        '.render-container-inner, .publish-renderer, ' +
+        '.markdown-preview-view, .markdown-rendered, ' +
+        '.markdown-preview-sizer'
+    );
+    for (const el of containers) {
+        el.style.setProperty('overflow', 'visible', 'important');
+    }
+}"""
+
+
+def make_toc_entry(path):
+    """Build a TOC item dict from a page path like 'Folder/Page.md'."""
+    title = path.rsplit("/", 1)[-1].removesuffix(".md")
+    url_path = path.removesuffix(".md").replace(" ", "+")
+    section = path.split("/")[0] if "/" in path else None
+    return {
+        "type": "page",
+        "title": title,
+        "url": f"{BASE_URL}/{url_path}",
+        "section": section,
+        "path": path,
+    }
+
+
+def make_section_entry(folder_name):
+    """Build a TOC item for a section title page (no URL)."""
+    title = folder_name.rsplit("/", 1)[-1]
+    return {
+        "type": "section",
+        "title": title,
+        "url": None,
+        "section": folder_name.split("/")[0],
+        "path": folder_name,
+    }
 
 
 def get_obsidian_toc_items():
     """
     Get the ordered list of documentation pages from the Obsidian Publish API.
-    Returns only actual page entries (ending in .md), excluding section headers,
-    hidden items, attachments, and non-content files.
+    Preserves the exact navigation ordering.  Folder entries become section
+    title pages; .md entries that follow a folder are kept in order.  For
+    folders whose children are NOT listed individually in the nav ordering,
+    children are fetched from the cache API (sorted alphabetically).
     """
     response = requests.get(OPTIONS_API)
     response.raise_for_status()
     options = response.json()
+
+    cache_response = requests.get(CACHE_API)
+    cache_response.raise_for_status()
+    all_cache_pages = set(cache_response.json().keys())
 
     nav_ordering = options.get("navigationOrdering", [])
     hidden_items = set(options.get("navigationHiddenItems", []))
@@ -85,40 +126,55 @@ def get_obsidian_toc_items():
     skip_prefixes = ("Attachments", "favicon", "publish.")
     skip_exact = {"Home.md"}
 
+    # Pre-scan: figure out which folder entries have explicit .md children
+    # listed after them in the nav ordering so we know when to fall back
+    # to the cache API.
+    nav_set = set(nav_ordering)
+
     toc_items = []
     seen = set()
 
     for entry in nav_ordering:
-        # Only process .md files (skip section headers like "Getting started")
-        if not entry.endswith(".md"):
-            continue
+        if entry.endswith(".md"):
+            # Page entry — add it in the order it appears
+            if entry in hidden_items or entry in skip_exact:
+                continue
+            if any(entry.startswith(p) for p in skip_prefixes):
+                continue
+            if entry in seen:
+                continue
+            seen.add(entry)
+            toc_items.append(make_toc_entry(entry))
+        else:
+            # Folder entry — skip non-content folders
+            if any(entry.startswith(p) for p in skip_prefixes):
+                continue
 
-        # Skip hidden, attachment, and non-content items
-        if entry in hidden_items or entry in skip_exact:
-            continue
-        if any(entry.startswith(p) for p in skip_prefixes):
-            continue
-        if entry in seen:
-            continue
+            # Add a section title page
+            toc_items.append(make_section_entry(entry))
 
-        seen.add(entry)
+            # Check if this folder's children are explicitly listed in nav.
+            # If so, they'll be picked up in subsequent loop iterations.
+            folder_prefix = entry + "/"
+            has_explicit_children = any(
+                e.startswith(folder_prefix) and e.endswith(".md")
+                for e in nav_set
+            )
 
-        # Build title from filename
-        title = entry.rsplit("/", 1)[-1].removesuffix(".md")
-
-        # Build URL: remove .md, encode spaces as +
-        url_path = entry.removesuffix(".md").replace(" ", "+")
-        full_url = f"{BASE_URL}/{url_path}"
-
-        # Determine section from folder path
-        section = entry.split("/")[0] if "/" in entry else None
-
-        toc_items.append({
-            "title": title,
-            "url": full_url,
-            "section": section,
-            "path": entry,
-        })
+            if not has_explicit_children:
+                # Fall back: fetch children from cache, sorted alphabetically
+                child_pages = sorted(
+                    p for p in all_cache_pages
+                    if p.startswith(folder_prefix)
+                    and p.endswith(".md")
+                    and p not in hidden_items
+                    and p not in seen
+                )
+                for child in child_pages:
+                    if any(child.startswith(p) for p in skip_prefixes):
+                        continue
+                    seen.add(child)
+                    toc_items.append(make_toc_entry(child))
 
     return toc_items
 
@@ -132,6 +188,43 @@ def get_pdf_filename(index, item):
     """Generate PDF filename from index and TOC item."""
     title = sanitize_filename(item["title"])
     return f"{index:03d}. {title}.pdf"
+
+
+def generate_section_title_pdf(title, output_path, browser):
+    """Generate a single-page PDF with a centered section title."""
+    if os.path.exists(output_path):
+        return False
+
+    page = browser.new_page()
+    try:
+        page.set_content(f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body {{
+    margin: 0; padding: 0;
+    height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-sans-serif, -apple-system, system-ui, sans-serif;
+    background: #fff;
+  }}
+  h1 {{
+    font-size: 36px;
+    font-weight: 600;
+    color: #222;
+    text-align: center;
+  }}
+</style>
+</head><body><h1>{title}</h1></body></html>""", wait_until="load")
+        page.pdf(
+            path=output_path,
+            format="Letter",
+            margin={"top": "0.45in", "right": "0.45in",
+                    "bottom": "0.45in", "left": "0.45in"},
+            print_background=True,
+        )
+    finally:
+        page.close()
+    return True
 
 
 def download_page_as_pdf(url, output_path, custom_css, browser):
@@ -148,13 +241,26 @@ def download_page_as_pdf(url, output_path, custom_css, browser):
         # Wait for the main content to appear (Obsidian Publish is an SPA)
         page.wait_for_selector(".markdown-rendered", timeout=15000)
 
-        # Inject custom CSS
+        # Wait for content to fully render (lazy-loaded images, embeds, etc.)
+        page.wait_for_function(
+            """() => {
+                const sizer = document.querySelector('.markdown-preview-sizer');
+                return sizer && sizer.scrollHeight > 100;
+            }""",
+            timeout=10000,
+        )
+
+        # Inject our CSS overrides
         page.add_style_tag(content=custom_css)
 
-        # Small delay for CSS to take effect
-        page.wait_for_timeout(300)
+        # Remove non-content DOM and unlock overflow, preserving all
+        # site styling (callout colors, code blocks, theme, backgrounds).
+        page.evaluate(PREPARE_FOR_PRINT_JS)
+        page.wait_for_timeout(500)
 
-        # Generate PDF
+        # Generate PDF — scale down to match the site's readable line width
+        # proportionally on a Letter page (site renders at ~620px content
+        # width; Letter printable area is ~730px at 96 dpi → 0.85 scale).
         page.pdf(
             path=output_path,
             format="Letter",
@@ -164,12 +270,44 @@ def download_page_as_pdf(url, output_path, custom_css, browser):
                 "bottom": "0.45in",
                 "left": "0.45in",
             },
-            print_background=False,
+            print_background=True,
+            scale=0.85,
         )
     finally:
         page.close()
 
+    # Strip trailing blank pages left by the SPA's viewport-height containers
+    _strip_trailing_blank_pages(output_path)
+
     return True
+
+
+def _strip_trailing_blank_pages(pdf_path):
+    """Remove trailing pages that have no text and no images."""
+    reader = PdfReader(pdf_path)
+    pages = reader.pages
+    if len(pages) <= 1:
+        return
+
+    # Walk backwards to find first non-empty page
+    last_good = len(pages) - 1
+    while last_good > 0:
+        pg = pages[last_good]
+        text = (pg.extract_text() or "").strip()
+        has_images = bool(pg.images) if hasattr(pg, "images") else False
+        has_xobjects = bool(pg.get("/Resources", {}).get("/XObject"))
+        if text or has_images or has_xobjects:
+            break
+        last_good -= 1
+
+    if last_good == len(pages) - 1:
+        return  # nothing to strip
+
+    writer = PdfWriter()
+    for i in range(last_good + 1):
+        writer.add_page(pages[i])
+    with open(pdf_path, "wb") as f:
+        writer.write(f)
 
 
 def merge_pdfs_with_toc(toc_items, output_dir, output_path):
@@ -181,7 +319,6 @@ def merge_pdfs_with_toc(toc_items, output_dir, output_path):
 
     print("\nMerging PDFs with table of contents...")
 
-    current_section = None
     section_bookmark = None
 
     for i, item in enumerate(toc_items, 1):
@@ -198,16 +335,17 @@ def merge_pdfs_with_toc(toc_items, output_dir, output_path):
             for page in reader.pages:
                 writer.add_page(page)
 
-            # Create section bookmark if entering a new section
-            if item["section"] and item["section"] != current_section:
-                current_section = item["section"]
+            if item["type"] == "section":
+                # Section title page gets a top-level bookmark
                 section_bookmark = writer.add_outline_item(
-                    current_section, start_page
+                    item["title"], start_page
                 )
-
-            # Add page bookmark (nested under section if applicable)
-            parent = section_bookmark if item["section"] else None
-            writer.add_outline_item(item["title"], start_page, parent=parent)
+            else:
+                # Content page — nested under current section if applicable
+                parent = section_bookmark if item["section"] else None
+                writer.add_outline_item(
+                    item["title"], start_page, parent=parent
+                )
 
             print(
                 f"    [{i}/{len(toc_items)}] Added: {item['title']} (page {start_page + 1})"
@@ -254,20 +392,33 @@ def main():
                 filename = get_pdf_filename(i, item)
                 output_path = os.path.join(output_dir, filename)
 
-                print(f"[{i}/{len(items)}] Downloading: {item['title']}")
-                print(f"    URL: {item['url']}")
-                print(f"    Saving to: {filename}")
+                if item["type"] == "section":
+                    print(f"[{i}/{len(items)}] Section: {item['title']}")
+                    try:
+                        created = generate_section_title_pdf(
+                            item["title"], output_path, browser
+                        )
+                        if created:
+                            print("    ✓ Created section page\n")
+                        else:
+                            print("    ↷ Skipped (already exists)\n")
+                    except Exception as e:
+                        print(f"    ✗ Error: {e}\n")
+                else:
+                    print(f"[{i}/{len(items)}] Downloading: {item['title']}")
+                    print(f"    URL: {item['url']}")
+                    print(f"    Saving to: {filename}")
 
-                try:
-                    downloaded = download_page_as_pdf(
-                        item["url"], output_path, custom_css, browser
-                    )
-                    if downloaded:
-                        print("    ✓ Success\n")
-                    else:
-                        print("    ↷ Skipped (already exists)\n")
-                except Exception as e:
-                    print(f"    ✗ Error: {e}\n")
+                    try:
+                        downloaded = download_page_as_pdf(
+                            item["url"], output_path, custom_css, browser
+                        )
+                        if downloaded:
+                            print("    ✓ Success\n")
+                        else:
+                            print("    ↷ Skipped (already exists)\n")
+                    except Exception as e:
+                        print(f"    ✗ Error: {e}\n")
 
             browser.close()
 
