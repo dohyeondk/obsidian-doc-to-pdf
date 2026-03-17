@@ -218,8 +218,8 @@ def generate_section_title_pdf(title, output_path, browser):
         page.pdf(
             path=output_path,
             format="Letter",
-            margin={"top": "0.45in", "right": "0.45in",
-                    "bottom": "0.45in", "left": "0.45in"},
+            margin={"top": "0.25in", "right": "0.25in",
+                    "bottom": "0.25in", "left": "0.25in"},
             print_background=True,
         )
     finally:
@@ -266,9 +266,9 @@ def download_page_as_pdf(url, output_path, custom_css, browser):
             format="Letter",
             margin={
                 "top": "0.45in",
-                "right": "0.45in",
+                "right": "0.25in",
                 "bottom": "0.45in",
-                "left": "0.45in",
+                "left": "0.25in",
             },
             print_background=True,
             scale=0.85,
